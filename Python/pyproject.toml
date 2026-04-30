@@ -18,5 +18,5 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-# The advanced server script is a single-file module
-py-modules = ["unreal_mcp_server_advanced"] 
+# Server scripts are single-file modules
+py-modules = ["unreal_mcp_server_advanced", "unreal_mcp_server"]

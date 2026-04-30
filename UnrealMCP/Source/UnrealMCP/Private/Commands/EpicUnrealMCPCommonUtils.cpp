@@ -25,7 +25,359 @@
 #include "BlueprintActionDatabase.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "UObject/UnrealType.h"
 
+namespace
+{
+UClass* FindLoadedClassByName(const FString& Candidate)
+{
+    const FString TrimmedCandidate = Candidate.TrimStartAndEnd();
+    if (TrimmedCandidate.IsEmpty())
+    {
+        return nullptr;
+    }
+
+    for (TObjectIterator<UClass> It; It; ++It)
+    {
+        UClass* LoadedClass = *It;
+        if (!LoadedClass)
+        {
+            continue;
+        }
+
+        if (LoadedClass->GetName().Equals(TrimmedCandidate, ESearchCase::IgnoreCase) ||
+            LoadedClass->GetPathName().Equals(TrimmedCandidate, ESearchCase::IgnoreCase) ||
+            LoadedClass->GetClassPathName().ToString().Equals(TrimmedCandidate, ESearchCase::IgnoreCase))
+        {
+            return LoadedClass;
+        }
+    }
+
+    return nullptr;
+}
+
+UObject* ResolveObjectReference(UClass* ExpectedClass, const FString& Input, FString& OutResolutionLog)
+{
+    const FString TrimmedInput = Input.TrimStartAndEnd();
+    if (TrimmedInput.IsEmpty() || TrimmedInput.Equals(TEXT("None"), ESearchCase::IgnoreCase) || TrimmedInput.Equals(TEXT("null"), ESearchCase::IgnoreCase))
+    {
+        OutResolutionLog = TEXT("null");
+        return nullptr;
+    }
+
+    auto IsCompatibleObject = [ExpectedClass](UObject* CandidateObject)
+    {
+        return CandidateObject && (!ExpectedClass || CandidateObject->IsA(ExpectedClass));
+    };
+
+    TArray<FString> Candidates;
+    auto AddCandidate = [&Candidates](const FString& Candidate)
+    {
+        if (!Candidate.IsEmpty())
+        {
+            Candidates.AddUnique(Candidate);
+        }
+    };
+
+    AddCandidate(TrimmedInput);
+    if (TrimmedInput.StartsWith(TEXT("/")) && !TrimmedInput.Contains(TEXT(".")))
+    {
+        AddCandidate(TrimmedInput + TEXT(".") + FPaths::GetBaseFilename(TrimmedInput));
+    }
+
+    for (const FString& Candidate : Candidates)
+    {
+        if (UObject* LoadedObject = LoadObject<UObject>(nullptr, *Candidate))
+        {
+            if (IsCompatibleObject(LoadedObject))
+            {
+                OutResolutionLog = Candidate;
+                return LoadedObject;
+            }
+        }
+
+        if (Candidate.StartsWith(TEXT("/")))
+        {
+            if (UObject* Asset = UEditorAssetLibrary::LoadAsset(Candidate))
+            {
+                if (IsCompatibleObject(Asset))
+                {
+                    OutResolutionLog = Candidate;
+                    return Asset;
+                }
+            }
+        }
+
+        if (UObject* FoundObject = FindObject<UObject>(nullptr, *Candidate))
+        {
+            if (IsCompatibleObject(FoundObject))
+            {
+                OutResolutionLog = Candidate;
+                return FoundObject;
+            }
+        }
+    }
+
+    for (TObjectIterator<UObject> It; It; ++It)
+    {
+        UObject* LoadedObject = *It;
+        if (!IsCompatibleObject(LoadedObject))
+        {
+            continue;
+        }
+
+        if (LoadedObject->GetName().Equals(TrimmedInput, ESearchCase::IgnoreCase) ||
+            LoadedObject->GetPathName().Equals(TrimmedInput, ESearchCase::IgnoreCase))
+        {
+            OutResolutionLog = TrimmedInput;
+            return LoadedObject;
+        }
+    }
+
+    OutResolutionLog = FString::Join(Candidates, TEXT(", "));
+    return nullptr;
+}
+
+UClass* ResolveClassReference(UClass* ExpectedBaseClass, const FString& Input, FString& OutResolutionLog)
+{
+    const FString TrimmedInput = Input.TrimStartAndEnd();
+    if (TrimmedInput.IsEmpty() || TrimmedInput.Equals(TEXT("None"), ESearchCase::IgnoreCase) || TrimmedInput.Equals(TEXT("null"), ESearchCase::IgnoreCase))
+    {
+        OutResolutionLog = TEXT("null");
+        return nullptr;
+    }
+
+    auto IsCompatibleClass = [ExpectedBaseClass](UClass* CandidateClass)
+    {
+        return CandidateClass && (!ExpectedBaseClass || CandidateClass->IsChildOf(ExpectedBaseClass));
+    };
+
+    auto TryBlueprintAsset = [&IsCompatibleClass, &OutResolutionLog](const FString& AssetPath) -> UClass*
+    {
+        if (UClass* BlueprintClass = UEditorAssetLibrary::LoadBlueprintClass(AssetPath))
+        {
+            if (IsCompatibleClass(BlueprintClass))
+            {
+                OutResolutionLog = AssetPath;
+                return BlueprintClass;
+            }
+        }
+
+        if (UBlueprint* BlueprintAsset = Cast<UBlueprint>(UEditorAssetLibrary::LoadAsset(AssetPath)))
+        {
+            if (IsCompatibleClass(BlueprintAsset->GeneratedClass))
+            {
+                OutResolutionLog = AssetPath;
+                return BlueprintAsset->GeneratedClass;
+            }
+        }
+
+        return nullptr;
+    };
+
+    TArray<FString> Candidates;
+    auto AddCandidate = [&Candidates](const FString& Candidate)
+    {
+        if (!Candidate.IsEmpty())
+        {
+            Candidates.AddUnique(Candidate);
+        }
+    };
+
+    AddCandidate(TrimmedInput);
+
+    if (!TrimmedInput.EndsWith(TEXT("_C")))
+    {
+        AddCandidate(TrimmedInput + TEXT("_C"));
+    }
+
+    if (TrimmedInput.StartsWith(TEXT("/")) && !TrimmedInput.Contains(TEXT(".")))
+    {
+        const FString AssetName = FPaths::GetBaseFilename(TrimmedInput);
+        AddCandidate(TrimmedInput + TEXT(".") + AssetName + TEXT("_C"));
+        AddCandidate(TrimmedInput + TEXT("_C"));
+    }
+    else if (TrimmedInput.Contains(TEXT(".")) && !TrimmedInput.EndsWith(TEXT("_C")) && !TrimmedInput.StartsWith(TEXT("/Script/")))
+    {
+        FString LeftPart;
+        FString RightPart;
+        if (TrimmedInput.Split(TEXT("."), &LeftPart, &RightPart, ESearchCase::IgnoreCase, ESearchDir::FromStart))
+        {
+            AddCandidate(LeftPart + TEXT(".") + RightPart + TEXT("_C"));
+        }
+    }
+
+    for (const FString& Candidate : Candidates)
+    {
+        if (UClass* LoadedClass = LoadObject<UClass>(nullptr, *Candidate))
+        {
+            if (IsCompatibleClass(LoadedClass))
+            {
+                OutResolutionLog = Candidate;
+                return LoadedClass;
+            }
+        }
+
+        if (UClass* FoundClass = FindObject<UClass>(nullptr, *Candidate))
+        {
+            if (IsCompatibleClass(FoundClass))
+            {
+                OutResolutionLog = Candidate;
+                return FoundClass;
+            }
+        }
+
+        if (UClass* LoadedClass = FindLoadedClassByName(Candidate))
+        {
+            if (IsCompatibleClass(LoadedClass))
+            {
+                OutResolutionLog = Candidate;
+                return LoadedClass;
+            }
+        }
+    }
+
+    if (TrimmedInput.StartsWith(TEXT("/")))
+    {
+        if (UClass* BlueprintClass = TryBlueprintAsset(TrimmedInput))
+        {
+            return BlueprintClass;
+        }
+    }
+    else
+    {
+        FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+        FARFilter Filter;
+        Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+        Filter.PackagePaths.Add(TEXT("/Game"));
+        Filter.PackagePaths.Add(TEXT("/Engine"));
+        Filter.bRecursivePaths = true;
+
+        TArray<FAssetData> BlueprintAssets;
+        AssetRegistryModule.Get().GetAssets(Filter, BlueprintAssets);
+        for (const FAssetData& AssetData : BlueprintAssets)
+        {
+            if (!AssetData.AssetName.ToString().Equals(TrimmedInput, ESearchCase::IgnoreCase))
+            {
+                continue;
+            }
+
+            if (UClass* BlueprintClass = TryBlueprintAsset(AssetData.PackageName.ToString()))
+            {
+                return BlueprintClass;
+            }
+        }
+    }
+
+    OutResolutionLog = FString::Join(Candidates, TEXT(", "));
+    return nullptr;
+}
+
+bool TryReadVectorValue(const TSharedPtr<FJsonValue>& Value, FVector& OutVector)
+{
+    if (!Value.IsValid())
+    {
+        return false;
+    }
+
+    if (Value->Type == EJson::Array)
+    {
+        const TArray<TSharedPtr<FJsonValue>>& ArrayValue = Value->AsArray();
+        if (ArrayValue.Num() >= 3)
+        {
+            OutVector.X = static_cast<float>(ArrayValue[0]->AsNumber());
+            OutVector.Y = static_cast<float>(ArrayValue[1]->AsNumber());
+            OutVector.Z = static_cast<float>(ArrayValue[2]->AsNumber());
+            return true;
+        }
+    }
+    else if (Value->Type == EJson::Object)
+    {
+        const TSharedPtr<FJsonObject> ObjectValue = Value->AsObject();
+        double X = 0.0;
+        double Y = 0.0;
+        double Z = 0.0;
+        if ((ObjectValue->TryGetNumberField(TEXT("x"), X) || ObjectValue->TryGetNumberField(TEXT("X"), X)) &&
+            (ObjectValue->TryGetNumberField(TEXT("y"), Y) || ObjectValue->TryGetNumberField(TEXT("Y"), Y)) &&
+            (ObjectValue->TryGetNumberField(TEXT("z"), Z) || ObjectValue->TryGetNumberField(TEXT("Z"), Z)))
+        {
+            OutVector = FVector(static_cast<float>(X), static_cast<float>(Y), static_cast<float>(Z));
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool TryReadVector2DValue(const TSharedPtr<FJsonValue>& Value, FVector2D& OutVector)
+{
+    if (!Value.IsValid())
+    {
+        return false;
+    }
+
+    if (Value->Type == EJson::Array)
+    {
+        const TArray<TSharedPtr<FJsonValue>>& ArrayValue = Value->AsArray();
+        if (ArrayValue.Num() >= 2)
+        {
+            OutVector.X = static_cast<float>(ArrayValue[0]->AsNumber());
+            OutVector.Y = static_cast<float>(ArrayValue[1]->AsNumber());
+            return true;
+        }
+    }
+    else if (Value->Type == EJson::Object)
+    {
+        const TSharedPtr<FJsonObject> ObjectValue = Value->AsObject();
+        double X = 0.0;
+        double Y = 0.0;
+        if ((ObjectValue->TryGetNumberField(TEXT("x"), X) || ObjectValue->TryGetNumberField(TEXT("X"), X)) &&
+            (ObjectValue->TryGetNumberField(TEXT("y"), Y) || ObjectValue->TryGetNumberField(TEXT("Y"), Y)))
+        {
+            OutVector = FVector2D(static_cast<float>(X), static_cast<float>(Y));
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool TryReadRotatorValue(const TSharedPtr<FJsonValue>& Value, FRotator& OutRotator)
+{
+    if (!Value.IsValid())
+    {
+        return false;
+    }
+
+    if (Value->Type == EJson::Array)
+    {
+        const TArray<TSharedPtr<FJsonValue>>& ArrayValue = Value->AsArray();
+        if (ArrayValue.Num() >= 3)
+        {
+            OutRotator.Pitch = static_cast<float>(ArrayValue[0]->AsNumber());
+            OutRotator.Yaw = static_cast<float>(ArrayValue[1]->AsNumber());
+            OutRotator.Roll = static_cast<float>(ArrayValue[2]->AsNumber());
+            return true;
+        }
+    }
+    else if (Value->Type == EJson::Object)
+    {
+        const TSharedPtr<FJsonObject> ObjectValue = Value->AsObject();
+        double Pitch = 0.0;
+        double Yaw = 0.0;
+        double Roll = 0.0;
+        if ((ObjectValue->TryGetNumberField(TEXT("pitch"), Pitch) || ObjectValue->TryGetNumberField(TEXT("Pitch"), Pitch)) &&
+            (ObjectValue->TryGetNumberField(TEXT("yaw"), Yaw) || ObjectValue->TryGetNumberField(TEXT("Yaw"), Yaw)) &&
+            (ObjectValue->TryGetNumberField(TEXT("roll"), Roll) || ObjectValue->TryGetNumberField(TEXT("Roll"), Roll)))
+        {
+            OutRotator = FRotator(static_cast<float>(Pitch), static_cast<float>(Yaw), static_cast<float>(Roll));
+            return true;
+        }
+    }
+
+    return false;
+}
+}
 // JSON Utilities
 TSharedPtr<FJsonObject> FEpicUnrealMCPCommonUtils::CreateErrorResponse(const FString& Message)
 {
@@ -154,7 +506,20 @@ UBlueprint* FEpicUnrealMCPCommonUtils::FindBlueprint(const FString& BlueprintNam
 UBlueprint* FEpicUnrealMCPCommonUtils::FindBlueprintByName(const FString& BlueprintName)
 {
     // The correct object path for a Blueprint asset is /Game/Path/AssetName.AssetName
-    FString ObjectPath = FString::Printf(TEXT("/Game/Blueprints/%s.%s"), *BlueprintName, *BlueprintName);
+    FString ObjectPath;
+
+    // Check if BlueprintName is already a full path (starts with /)
+    if (BlueprintName.StartsWith(TEXT("/")))
+    {
+        // It's already a full path, use it directly with the class suffix
+        FString AssetName = FPaths::GetBaseFilename(BlueprintName);
+        ObjectPath = FString::Printf(TEXT("%s.%s"), *BlueprintName, *AssetName);
+    }
+    else
+    {
+        // It's just a name, add the default /Game/Blueprints/ prefix
+        ObjectPath = FString::Printf(TEXT("/Game/Blueprints/%s.%s"), *BlueprintName, *BlueprintName);
+    }
 
     // First, try to load the object directly, as it's the fastest method.
     UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *ObjectPath);
@@ -181,7 +546,7 @@ UBlueprint* FEpicUnrealMCPCommonUtils::FindBlueprintByName(const FString& Bluepr
     // where it might be found via its package path.
     FString PackagePath = TEXT("/Game/Blueprints/") + BlueprintName;
     Blueprint = FindObject<UBlueprint>(nullptr, *PackagePath);
-    
+
     if (!Blueprint)
     {
          UE_LOG(LogTemp, Error, TEXT("FindBlueprintByName: Failed to find or load blueprint: %s"), *BlueprintName);
@@ -551,6 +916,12 @@ bool FEpicUnrealMCPCommonUtils::SetObjectProperty(UObject* Object, const FString
         return false;
     }
 
+    if (!Value.IsValid())
+    {
+        OutErrorMessage = TEXT("Invalid property value");
+        return false;
+    }
+
     FProperty* Property = Object->GetClass()->FindPropertyByName(*PropertyName);
     if (!Property)
     {
@@ -559,184 +930,216 @@ bool FEpicUnrealMCPCommonUtils::SetObjectProperty(UObject* Object, const FString
     }
 
     void* PropertyAddr = Property->ContainerPtrToValuePtr<void>(Object);
-    
-    // Handle different property types
-    if (Property->IsA<FBoolProperty>())
+
+    if (FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property))
     {
-        ((FBoolProperty*)Property)->SetPropertyValue(PropertyAddr, Value->AsBool());
+        BoolProperty->SetPropertyValue(PropertyAddr, Value->AsBool());
         return true;
     }
-    else if (Property->IsA<FIntProperty>())
+
+    if (FIntProperty* IntProperty = CastField<FIntProperty>(Property))
     {
-        int32 IntValue = static_cast<int32>(Value->AsNumber());
-        FIntProperty* IntProperty = CastField<FIntProperty>(Property);
-        if (IntProperty)
+        IntProperty->SetPropertyValue(PropertyAddr, static_cast<int32>(Value->AsNumber()));
+        return true;
+    }
+
+    if (FFloatProperty* FloatProperty = CastField<FFloatProperty>(Property))
+    {
+        FloatProperty->SetPropertyValue(PropertyAddr, static_cast<float>(Value->AsNumber()));
+        return true;
+    }
+
+    if (FDoubleProperty* DoubleProperty = CastField<FDoubleProperty>(Property))
+    {
+        DoubleProperty->SetPropertyValue(PropertyAddr, Value->AsNumber());
+        return true;
+    }
+
+    if (FStrProperty* StrProperty = CastField<FStrProperty>(Property))
+    {
+        StrProperty->SetPropertyValue(PropertyAddr, Value->AsString());
+        return true;
+    }
+
+    if (FNameProperty* NameProperty = CastField<FNameProperty>(Property))
+    {
+        NameProperty->SetPropertyValue(PropertyAddr, FName(*Value->AsString()));
+        return true;
+    }
+
+    if (FClassProperty* ClassProperty = CastField<FClassProperty>(Property))
+    {
+        FString ResolutionLog;
+        UClass* ResolvedClass = nullptr;
+        if (Value->Type == EJson::String)
         {
-            IntProperty->SetPropertyValue_InContainer(Object, IntValue);
-            return true;
+            ResolvedClass = ResolveClassReference(ClassProperty->MetaClass, Value->AsString(), ResolutionLog);
         }
-    }
-    else if (Property->IsA<FFloatProperty>())
-    {
-        ((FFloatProperty*)Property)->SetPropertyValue(PropertyAddr, Value->AsNumber());
+
+        if (!ResolvedClass && Value->Type != EJson::Null)
+        {
+            OutErrorMessage = FString::Printf(TEXT("Could not resolve class reference for '%s'. Tried: %s"), *PropertyName, *ResolutionLog);
+            return false;
+        }
+
+        ClassProperty->SetObjectPropertyValue(PropertyAddr, ResolvedClass);
         return true;
     }
-    else if (Property->IsA<FStrProperty>())
+
+    if (FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
     {
-        ((FStrProperty*)Property)->SetPropertyValue(PropertyAddr, Value->AsString());
+        UObject* ResolvedObject = nullptr;
+        FString ResolutionLog;
+        if (Value->Type == EJson::String)
+        {
+            ResolvedObject = ResolveObjectReference(ObjectProperty->PropertyClass, Value->AsString(), ResolutionLog);
+        }
+
+        if (!ResolvedObject && Value->Type != EJson::Null)
+        {
+            OutErrorMessage = FString::Printf(TEXT("Could not resolve object reference for '%s'. Tried: %s"), *PropertyName, *ResolutionLog);
+            return false;
+        }
+
+        ObjectProperty->SetObjectPropertyValue(PropertyAddr, ResolvedObject);
         return true;
     }
-    else if (Property->IsA<FByteProperty>())
+
+    if (FByteProperty* ByteProp = CastField<FByteProperty>(Property))
     {
-        FByteProperty* ByteProp = CastField<FByteProperty>(Property);
-        UEnum* EnumDef = ByteProp ? ByteProp->GetIntPropertyEnum() : nullptr;
-        
-        // If this is a TEnumAsByte property (has associated enum)
+        UEnum* EnumDef = ByteProp->GetIntPropertyEnum();
         if (EnumDef)
         {
-            // Handle numeric value
             if (Value->Type == EJson::Number)
             {
-                uint8 ByteValue = static_cast<uint8>(Value->AsNumber());
-                ByteProp->SetPropertyValue(PropertyAddr, ByteValue);
-                
-                UE_LOG(LogTemp, Display, TEXT("Setting enum property %s to numeric value: %d"), 
-                      *PropertyName, ByteValue);
+                ByteProp->SetPropertyValue(PropertyAddr, static_cast<uint8>(Value->AsNumber()));
                 return true;
             }
-            // Handle string enum value
-            else if (Value->Type == EJson::String)
+
+            if (Value->Type == EJson::String)
             {
                 FString EnumValueName = Value->AsString();
-                
-                // Try to convert numeric string to number first
                 if (EnumValueName.IsNumeric())
                 {
-                    uint8 ByteValue = FCString::Atoi(*EnumValueName);
-                    ByteProp->SetPropertyValue(PropertyAddr, ByteValue);
-                    
-                    UE_LOG(LogTemp, Display, TEXT("Setting enum property %s to numeric string value: %s -> %d"), 
-                          *PropertyName, *EnumValueName, ByteValue);
+                    ByteProp->SetPropertyValue(PropertyAddr, static_cast<uint8>(FCString::Atoi(*EnumValueName)));
                     return true;
                 }
-                
-                // Handle qualified enum names (e.g., "Player0" or "EAutoReceiveInput::Player0")
+
                 if (EnumValueName.Contains(TEXT("::")))
                 {
                     EnumValueName.Split(TEXT("::"), nullptr, &EnumValueName);
                 }
-                
+
                 int64 EnumValue = EnumDef->GetValueByNameString(EnumValueName);
                 if (EnumValue == INDEX_NONE)
                 {
-                    // Try with full name as fallback
                     EnumValue = EnumDef->GetValueByNameString(Value->AsString());
                 }
-                
+
                 if (EnumValue != INDEX_NONE)
                 {
                     ByteProp->SetPropertyValue(PropertyAddr, static_cast<uint8>(EnumValue));
-                    
-                    UE_LOG(LogTemp, Display, TEXT("Setting enum property %s to name value: %s -> %lld"), 
-                          *PropertyName, *EnumValueName, EnumValue);
                     return true;
                 }
-                else
-                {
-                    // Log all possible enum values for debugging
-                    UE_LOG(LogTemp, Warning, TEXT("Could not find enum value for '%s'. Available options:"), *EnumValueName);
-                    for (int32 i = 0; i < EnumDef->NumEnums(); i++)
-                    {
-                        UE_LOG(LogTemp, Warning, TEXT("  - %s (value: %d)"), 
-                               *EnumDef->GetNameStringByIndex(i), EnumDef->GetValueByIndex(i));
-                    }
-                    
-                    OutErrorMessage = FString::Printf(TEXT("Could not find enum value for '%s'"), *EnumValueName);
-                    return false;
-                }
+
+                OutErrorMessage = FString::Printf(TEXT("Could not find enum value for '%s'"), *EnumValueName);
+                return false;
             }
         }
         else
         {
-            // Regular byte property
-            uint8 ByteValue = static_cast<uint8>(Value->AsNumber());
-            ByteProp->SetPropertyValue(PropertyAddr, ByteValue);
+            ByteProp->SetPropertyValue(PropertyAddr, static_cast<uint8>(Value->AsNumber()));
             return true;
         }
     }
-    else if (Property->IsA<FEnumProperty>())
+
+    if (FEnumProperty* EnumProp = CastField<FEnumProperty>(Property))
     {
-        FEnumProperty* EnumProp = CastField<FEnumProperty>(Property);
-        UEnum* EnumDef = EnumProp ? EnumProp->GetEnum() : nullptr;
-        FNumericProperty* UnderlyingNumericProp = EnumProp ? EnumProp->GetUnderlyingProperty() : nullptr;
-        
+        UEnum* EnumDef = EnumProp->GetEnum();
+        FNumericProperty* UnderlyingNumericProp = EnumProp->GetUnderlyingProperty();
         if (EnumDef && UnderlyingNumericProp)
         {
-            // Handle numeric value
             if (Value->Type == EJson::Number)
             {
-                int64 EnumValue = static_cast<int64>(Value->AsNumber());
-                UnderlyingNumericProp->SetIntPropertyValue(PropertyAddr, EnumValue);
-                
-                UE_LOG(LogTemp, Display, TEXT("Setting enum property %s to numeric value: %lld"), 
-                      *PropertyName, EnumValue);
+                UnderlyingNumericProp->SetIntPropertyValue(PropertyAddr, static_cast<int64>(Value->AsNumber()));
                 return true;
             }
-            // Handle string enum value
-            else if (Value->Type == EJson::String)
+
+            if (Value->Type == EJson::String)
             {
                 FString EnumValueName = Value->AsString();
-                
-                // Try to convert numeric string to number first
                 if (EnumValueName.IsNumeric())
                 {
-                    int64 EnumValue = FCString::Atoi64(*EnumValueName);
-                    UnderlyingNumericProp->SetIntPropertyValue(PropertyAddr, EnumValue);
-                    
-                    UE_LOG(LogTemp, Display, TEXT("Setting enum property %s to numeric string value: %s -> %lld"), 
-                          *PropertyName, *EnumValueName, EnumValue);
+                    UnderlyingNumericProp->SetIntPropertyValue(PropertyAddr, FCString::Atoi64(*EnumValueName));
                     return true;
                 }
-                
-                // Handle qualified enum names
+
                 if (EnumValueName.Contains(TEXT("::")))
                 {
                     EnumValueName.Split(TEXT("::"), nullptr, &EnumValueName);
                 }
-                
+
                 int64 EnumValue = EnumDef->GetValueByNameString(EnumValueName);
                 if (EnumValue == INDEX_NONE)
                 {
-                    // Try with full name as fallback
                     EnumValue = EnumDef->GetValueByNameString(Value->AsString());
                 }
-                
+
                 if (EnumValue != INDEX_NONE)
                 {
                     UnderlyingNumericProp->SetIntPropertyValue(PropertyAddr, EnumValue);
-                    
-                    UE_LOG(LogTemp, Display, TEXT("Setting enum property %s to name value: %s -> %lld"), 
-                          *PropertyName, *EnumValueName, EnumValue);
                     return true;
                 }
-                else
-                {
-                    // Log all possible enum values for debugging
-                    UE_LOG(LogTemp, Warning, TEXT("Could not find enum value for '%s'. Available options:"), *EnumValueName);
-                    for (int32 i = 0; i < EnumDef->NumEnums(); i++)
-                    {
-                        UE_LOG(LogTemp, Warning, TEXT("  - %s (value: %d)"), 
-                               *EnumDef->GetNameStringByIndex(i), EnumDef->GetValueByIndex(i));
-                    }
-                    
-                    OutErrorMessage = FString::Printf(TEXT("Could not find enum value for '%s'"), *EnumValueName);
-                    return false;
-                }
+
+                OutErrorMessage = FString::Printf(TEXT("Could not find enum value for '%s'"), *EnumValueName);
+                return false;
             }
         }
     }
-    
+
+    if (FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+    {
+        if (StructProperty->Struct == TBaseStructure<FVector>::Get())
+        {
+            FVector VectorValue;
+            if (!TryReadVectorValue(Value, VectorValue))
+            {
+                OutErrorMessage = FString::Printf(TEXT("Expected FVector-compatible JSON value for property %s"), *PropertyName);
+                return false;
+            }
+
+            StructProperty->Struct->CopyScriptStruct(PropertyAddr, &VectorValue);
+            return true;
+        }
+
+        if (StructProperty->Struct == TBaseStructure<FVector2D>::Get())
+        {
+            FVector2D Vector2DValue;
+            if (!TryReadVector2DValue(Value, Vector2DValue))
+            {
+                OutErrorMessage = FString::Printf(TEXT("Expected FVector2D-compatible JSON value for property %s"), *PropertyName);
+                return false;
+            }
+
+            StructProperty->Struct->CopyScriptStruct(PropertyAddr, &Vector2DValue);
+            return true;
+        }
+
+        if (StructProperty->Struct == TBaseStructure<FRotator>::Get())
+        {
+            FRotator RotatorValue;
+            if (!TryReadRotatorValue(Value, RotatorValue))
+            {
+                OutErrorMessage = FString::Printf(TEXT("Expected FRotator-compatible JSON value for property %s"), *PropertyName);
+                return false;
+            }
+
+            StructProperty->Struct->CopyScriptStruct(PropertyAddr, &RotatorValue);
+            return true;
+        }
+    }
+
     OutErrorMessage = FString::Printf(TEXT("Unsupported property type: %s for property %s"), 
                                     *Property->GetClass()->GetName(), *PropertyName);
     return false;
-} 
+}
