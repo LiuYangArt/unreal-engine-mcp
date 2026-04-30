@@ -33,8 +33,41 @@
 
 namespace
 {
+FString NormalizeTypeCandidate(const FString& Input)
+{
+    FString Normalized = Input.TrimStartAndEnd();
+    if (Normalized.IsEmpty())
+    {
+        return Normalized;
+    }
+
+    if (Normalized.StartsWith(TEXT("/")))
+    {
+        const int32 DotIndex = Normalized.Find(TEXT("."), ESearchCase::IgnoreCase, ESearchDir::FromStart);
+        Normalized = DotIndex != INDEX_NONE ? Normalized.Mid(DotIndex + 1) : FPaths::GetBaseFilename(Normalized);
+    }
+    else if (Normalized.Contains(TEXT(".")))
+    {
+        FString LeftPart;
+        if (Normalized.Split(TEXT("."), &LeftPart, &Normalized, ESearchCase::IgnoreCase, ESearchDir::FromStart))
+        {
+        }
+    }
+
+    if (Normalized.Len() > 1 &&
+        (Normalized.StartsWith(TEXT("A")) || Normalized.StartsWith(TEXT("U"))) &&
+        FChar::IsUpper(Normalized[1]))
+    {
+        Normalized.RightChopInline(1, false);
+    }
+
+    return Normalized;
+}
+
 UClass* FindLoadedClassByCandidate(const FString& Candidate)
 {
+    const FString NormalizedCandidate = NormalizeTypeCandidate(Candidate);
+
     for (TObjectIterator<UClass> It; It; ++It)
     {
         UClass* LoadedClass = *It;
@@ -43,9 +76,20 @@ UClass* FindLoadedClassByCandidate(const FString& Candidate)
             continue;
         }
 
-        if (LoadedClass->GetName().Equals(Candidate, ESearchCase::IgnoreCase) ||
-            LoadedClass->GetPathName().Equals(Candidate, ESearchCase::IgnoreCase) ||
-            LoadedClass->GetClassPathName().ToString().Equals(Candidate, ESearchCase::IgnoreCase))
+        const FString LoadedName = LoadedClass->GetName();
+        const FString LoadedPath = LoadedClass->GetPathName();
+        const FString LoadedClassPath = LoadedClass->GetClassPathName().ToString();
+        const FString NormalizedLoadedName = NormalizeTypeCandidate(LoadedName);
+        const FString NormalizedLoadedPath = NormalizeTypeCandidate(LoadedPath);
+        const FString NormalizedLoadedClassPath = NormalizeTypeCandidate(LoadedClassPath);
+
+        if (LoadedName.Equals(Candidate, ESearchCase::IgnoreCase) ||
+            LoadedPath.Equals(Candidate, ESearchCase::IgnoreCase) ||
+            LoadedClassPath.Equals(Candidate, ESearchCase::IgnoreCase) ||
+            (!NormalizedCandidate.IsEmpty() &&
+                (NormalizedLoadedName.Equals(NormalizedCandidate, ESearchCase::IgnoreCase) ||
+                 NormalizedLoadedPath.Equals(NormalizedCandidate, ESearchCase::IgnoreCase) ||
+                 NormalizedLoadedClassPath.Equals(NormalizedCandidate, ESearchCase::IgnoreCase))))
         {
             return LoadedClass;
         }
@@ -54,18 +98,38 @@ UClass* FindLoadedClassByCandidate(const FString& Candidate)
     return nullptr;
 }
 
+void AddUniqueCandidate(TArray<FString>& Candidates, const FString& Candidate)
+{
+    if (!Candidate.IsEmpty())
+    {
+        Candidates.AddUnique(Candidate);
+    }
+}
+
+void AddScriptPathCandidates(TArray<FString>& Candidates, const FString& Candidate)
+{
+    if (Candidate.IsEmpty() || Candidate.StartsWith(TEXT("/")))
+    {
+        return;
+    }
+
+    const FString ScriptToken = NormalizeTypeCandidate(Candidate);
+    if (ScriptToken.IsEmpty())
+    {
+        return;
+    }
+
+    AddUniqueCandidate(Candidates, FString::Printf(TEXT("/Script/%s.%s"), FApp::GetProjectName(), *ScriptToken));
+    AddUniqueCandidate(Candidates, FString::Printf(TEXT("/Script/Engine.%s"), *ScriptToken));
+    AddUniqueCandidate(Candidates, FString::Printf(TEXT("/Script/Game.%s"), *ScriptToken));
+    AddUniqueCandidate(Candidates, FString::Printf(TEXT("/Script/Angelscript.%s"), *ScriptToken));
+    AddUniqueCandidate(Candidates, FString::Printf(TEXT("/Script/UMG.%s"), *ScriptToken));
+}
+
 UClass* ResolveBlueprintParentClass(const FString& ParentClassInput, FString& OutResolutionLog)
 {
     TArray<FString> Candidates;
-    Candidates.Reserve(12);
-
-    auto AddCandidate = [&Candidates](const FString& Candidate)
-    {
-        if (!Candidate.IsEmpty())
-        {
-            Candidates.AddUnique(Candidate);
-        }
-    };
+    Candidates.Reserve(24);
 
     const FString TrimmedInput = ParentClassInput.TrimStartAndEnd();
     if (TrimmedInput.IsEmpty())
@@ -73,8 +137,6 @@ UClass* ResolveBlueprintParentClass(const FString& ParentClassInput, FString& Ou
         OutResolutionLog = TEXT("empty parent class");
         return nullptr;
     }
-
-    AddCandidate(TrimmedInput);
 
     FString BareClassName = TrimmedInput;
     if (TrimmedInput.StartsWith(TEXT("/")))
@@ -87,29 +149,32 @@ UClass* ResolveBlueprintParentClass(const FString& ParentClassInput, FString& Ou
         FString LeftPart;
         if (TrimmedInput.Split(TEXT("."), &LeftPart, &BareClassName, ESearchCase::IgnoreCase, ESearchDir::FromStart))
         {
-            AddCandidate(LeftPart + TEXT(".") + BareClassName);
+            AddUniqueCandidate(Candidates, LeftPart + TEXT(".") + BareClassName);
         }
     }
 
-    AddCandidate(BareClassName);
+    const FString NormalizedBareClassName = NormalizeTypeCandidate(BareClassName);
+
+    AddUniqueCandidate(Candidates, TrimmedInput);
+    AddUniqueCandidate(Candidates, BareClassName);
+    AddUniqueCandidate(Candidates, NormalizedBareClassName);
 
     if (!BareClassName.StartsWith(TEXT("A")) && !BareClassName.StartsWith(TEXT("U")))
     {
-        AddCandidate(TEXT("A") + BareClassName);
-        AddCandidate(TEXT("U") + BareClassName);
+        AddUniqueCandidate(Candidates, TEXT("A") + BareClassName);
+        AddUniqueCandidate(Candidates, TEXT("U") + BareClassName);
     }
 
-    const FString ProjectScriptPrefix = FString::Printf(TEXT("/Script/%s."), FApp::GetProjectName());
+    if (!NormalizedBareClassName.IsEmpty() && !NormalizedBareClassName.Equals(BareClassName, ESearchCase::IgnoreCase))
+    {
+        AddUniqueCandidate(Candidates, TEXT("A") + NormalizedBareClassName);
+        AddUniqueCandidate(Candidates, TEXT("U") + NormalizedBareClassName);
+    }
+
     const TArray<FString> NameCandidates = Candidates;
     for (const FString& Candidate : NameCandidates)
     {
-        if (!Candidate.StartsWith(TEXT("/")))
-        {
-            AddCandidate(ProjectScriptPrefix + Candidate);
-            AddCandidate(TEXT("/Script/Engine.") + Candidate);
-            AddCandidate(TEXT("/Script/Game.") + Candidate);
-            AddCandidate(TEXT("/Script/Angelscript.") + Candidate);
-        }
+        AddScriptPathCandidates(Candidates, Candidate);
     }
 
     for (const FString& Candidate : Candidates)
@@ -120,10 +185,76 @@ UClass* ResolveBlueprintParentClass(const FString& ParentClassInput, FString& Ou
             return LoadedClass;
         }
 
+        if (UClass* LoadedClass = FindObject<UClass>(nullptr, *Candidate))
+        {
+            OutResolutionLog = Candidate;
+            return LoadedClass;
+        }
+
         if (UClass* LoadedClass = FindLoadedClassByCandidate(Candidate))
         {
             OutResolutionLog = Candidate;
             return LoadedClass;
+        }
+    }
+
+    OutResolutionLog = FString::Join(Candidates, TEXT(", "));
+    return nullptr;
+}
+
+UClass* ResolveComponentClass(const FString& ComponentTypeInput, FString& OutResolutionLog)
+{
+    TArray<FString> Candidates;
+    Candidates.Reserve(24);
+
+    const FString TrimmedInput = ComponentTypeInput.TrimStartAndEnd();
+    if (TrimmedInput.IsEmpty())
+    {
+        OutResolutionLog = TEXT("empty component type");
+        return nullptr;
+    }
+
+    const FString NormalizedInput = NormalizeTypeCandidate(TrimmedInput);
+
+    AddUniqueCandidate(Candidates, TrimmedInput);
+    AddUniqueCandidate(Candidates, NormalizedInput);
+
+    if (!NormalizedInput.IsEmpty() && !NormalizedInput.EndsWith(TEXT("Component")))
+    {
+        AddUniqueCandidate(Candidates, NormalizedInput + TEXT("Component"));
+    }
+
+    if (!NormalizedInput.IsEmpty())
+    {
+        AddUniqueCandidate(Candidates, TEXT("U") + NormalizedInput);
+        if (!NormalizedInput.EndsWith(TEXT("Component")))
+        {
+            AddUniqueCandidate(Candidates, TEXT("U") + NormalizedInput + TEXT("Component"));
+        }
+    }
+
+    const TArray<FString> NameCandidates = Candidates;
+    for (const FString& Candidate : NameCandidates)
+    {
+        AddScriptPathCandidates(Candidates, Candidate);
+    }
+
+    for (const FString& Candidate : Candidates)
+    {
+        UClass* ComponentClass = LoadObject<UClass>(nullptr, *Candidate);
+        if (!ComponentClass)
+        {
+            ComponentClass = FindObject<UClass>(nullptr, *Candidate);
+        }
+        if (!ComponentClass)
+        {
+            ComponentClass = FindLoadedClassByCandidate(Candidate);
+        }
+
+        if (ComponentClass && ComponentClass->IsChildOf(UActorComponent::StaticClass()))
+        {
+            OutResolutionLog = Candidate;
+            return ComponentClass;
         }
     }
 
@@ -324,37 +455,12 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleAddComponentToBlu
         return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
     }
 
-    // Create the component - dynamically find the component class by name
-    UClass* ComponentClass = nullptr;
-
-    // Try to find the class with exact name first
-    ComponentClass = FindObject<UClass>(nullptr, *ComponentType);
-    
-    // If not found, try with "Component" suffix
-    if (!ComponentClass && !ComponentType.EndsWith(TEXT("Component")))
+    FString ComponentResolutionLog;
+    UClass* ComponentClass = ResolveComponentClass(ComponentType, ComponentResolutionLog);
+    if (!ComponentClass)
     {
-        FString ComponentTypeWithSuffix = ComponentType + TEXT("Component");
-        ComponentClass = FindObject<UClass>(nullptr, *ComponentTypeWithSuffix);
-    }
-    
-    // If still not found, try with "U" prefix
-    if (!ComponentClass && !ComponentType.StartsWith(TEXT("U")))
-    {
-        FString ComponentTypeWithPrefix = TEXT("U") + ComponentType;
-        ComponentClass = FindObject<UClass>(nullptr, *ComponentTypeWithPrefix);
-        
-        // Try with both prefix and suffix
-        if (!ComponentClass && !ComponentType.EndsWith(TEXT("Component")))
-        {
-            FString ComponentTypeWithBoth = TEXT("U") + ComponentType + TEXT("Component");
-            ComponentClass = FindObject<UClass>(nullptr, *ComponentTypeWithBoth);
-        }
-    }
-    
-    // Verify that the class is a valid component type
-    if (!ComponentClass || !ComponentClass->IsChildOf(UActorComponent::StaticClass()))
-    {
-        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown component type: %s"), *ComponentType));
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Unknown component type: %s. Tried: %s"), *ComponentType, *ComponentResolutionLog));
     }
 
     // Add the component to the blueprint
