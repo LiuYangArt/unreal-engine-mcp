@@ -23,6 +23,7 @@
 #include "Engine/SCS_Node.h"
 #include "UObject/Field.h"
 #include "UObject/FieldPath.h"
+#include "UObject/UnrealType.h"
 #include "EditorAssetLibrary.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "GameFramework/Actor.h"
@@ -277,6 +278,75 @@ USCS_Node* FindBlueprintComponentNode(UBlueprint* Blueprint, const FString& Comp
         }
     }
 
+    return nullptr;
+}
+
+UObject* FindBlueprintComponentObject(UBlueprint* Blueprint, const FString& ComponentName, FString& OutResolutionLog)
+{
+    if (!Blueprint)
+    {
+        OutResolutionLog = TEXT("invalid blueprint");
+        return nullptr;
+    }
+
+    if (USCS_Node* ComponentNode = FindBlueprintComponentNode(Blueprint, ComponentName))
+    {
+        if (ComponentNode->ComponentTemplate)
+        {
+            OutResolutionLog = TEXT("SimpleConstructionScript.ComponentTemplate");
+            return ComponentNode->ComponentTemplate;
+        }
+    }
+
+    if (!Blueprint->GeneratedClass)
+    {
+        FKismetEditorUtilities::CompileBlueprint(Blueprint);
+    }
+
+    UClass* GeneratedClass = Blueprint->GeneratedClass;
+    if (!GeneratedClass)
+    {
+        OutResolutionLog = TEXT("generated class missing after compile");
+        return nullptr;
+    }
+
+    UObject* DefaultObject = GeneratedClass->GetDefaultObject();
+    if (!DefaultObject)
+    {
+        OutResolutionLog = TEXT("default object missing");
+        return nullptr;
+    }
+
+    if (FProperty* Property = GeneratedClass->FindPropertyByName(*ComponentName))
+    {
+        if (FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
+        {
+            if (UObject* PropertyObject = ObjectProperty->GetObjectPropertyValue_InContainer(DefaultObject))
+            {
+                OutResolutionLog = TEXT("GeneratedClass.ObjectProperty");
+                return PropertyObject;
+            }
+        }
+    }
+
+    if (UObject* DefaultSubobject = DefaultObject->GetDefaultSubobjectByName(*ComponentName))
+    {
+        OutResolutionLog = TEXT("DefaultObject.GetDefaultSubobjectByName");
+        return DefaultSubobject;
+    }
+
+    TArray<UObject*> DefaultSubobjects;
+    DefaultObject->GetDefaultSubobjects(DefaultSubobjects);
+    for (UObject* DefaultSubobject : DefaultSubobjects)
+    {
+        if (DefaultSubobject && DefaultSubobject->GetName().Equals(ComponentName, ESearchCase::IgnoreCase))
+        {
+            OutResolutionLog = TEXT("DefaultObject.GetDefaultSubobjects");
+            return DefaultSubobject;
+        }
+    }
+
+    OutResolutionLog = TEXT("not found in SCS, generated class object property, or default subobjects");
     return nullptr;
 }
 }
@@ -545,17 +615,19 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleSetComponentPrope
         return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
     }
 
-    USCS_Node* ComponentNode = FindBlueprintComponentNode(Blueprint, ComponentName);
-    if (!ComponentNode || !ComponentNode->ComponentTemplate)
+    FString ResolutionLog;
+    UObject* ComponentObject = FindBlueprintComponentObject(Blueprint, ComponentName, ResolutionLog);
+    if (!ComponentObject)
     {
-        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Component not found: %s"), *ComponentName));
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Component not found: %s (checked %s)"), *ComponentName, *ResolutionLog));
     }
 
     FString ErrorMessage;
-    if (!FEpicUnrealMCPCommonUtils::SetObjectProperty(ComponentNode->ComponentTemplate, PropertyName, Params->Values.FindChecked(TEXT("property_value")), ErrorMessage))
+    if (!FEpicUnrealMCPCommonUtils::SetObjectProperty(ComponentObject, PropertyName, Params->Values.FindChecked(TEXT("property_value")), ErrorMessage))
     {
         return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
-            FString::Printf(TEXT("Failed to set component property '%s': %s"), *PropertyName, *ErrorMessage));
+            FString::Printf(TEXT("Failed to set component property '%s' on '%s': %s"), *PropertyName, *ComponentName, *ErrorMessage));
     }
 
     FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
